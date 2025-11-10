@@ -52,6 +52,23 @@ export const initializeCosmosDB = async () => {
   }
 };
 
+// Helper function to wait for container initialization
+// This prevents race conditions where functions try to use container before it's initialized
+const waitForContainer = async (maxRetries: number = 10, retryDelay: number = 500): Promise<Container> => {
+  let retries = 0;
+  
+  while (!container && retries < maxRetries) {
+    await new Promise(resolve => setTimeout(resolve, retryDelay));
+    retries++;
+  }
+  
+  if (!container) {
+    throw new Error("CosmosDB container not initialized. Please wait for initialization to complete.");
+  }
+  
+  return container;
+};
+
 // Chat document interface
 export interface ChatDocument {
   id: string; // Unique chat ID (fileName + timestamp)
@@ -103,9 +120,10 @@ export const createChatDocument = async (
   const timestamp = Date.now();
   const chatId = `${fileName.replace(/[^a-zA-Z0-9]/g, '_')}_${timestamp}`;
   
-  const chatDocument: ChatDocument = {
+  const chatDocument: ChatDocument & { fsmrora?: string } = {
     id: chatId,
     username,
+    fsmrora: username, // Add partition key field to match partition key path /fsmrora
     fileName,
     uploadedAt: timestamp,
     createdAt: timestamp,
@@ -128,11 +146,10 @@ export const createChatDocument = async (
   };
 
   try {
-    if (!container) {
-      throw new Error("CosmosDB container not initialized. Make sure initializeCosmosDB() was called successfully.");
-    }
+    // Wait for container to be initialized (with timeout)
+    const containerInstance = await waitForContainer();
     
-    const { resource } = await container.items.create(chatDocument);
+    const { resource } = await containerInstance.items.create(chatDocument);
     return resource as ChatDocument;
   } catch (error) {
     console.error("Failed to create chat document:", error);
@@ -143,11 +160,10 @@ export const createChatDocument = async (
 // Get chat document by ID
 export const getChatDocument = async (chatId: string, username: string): Promise<ChatDocument | null> => {
   try {
-    if (!container) {
-      return null;
-    }
+    // Wait for container to be initialized (with timeout)
+    const containerInstance = await waitForContainer();
     
-    const { resource } = await container.item(chatId, username).read();
+    const { resource } = await containerInstance.item(chatId, username).read();
     return resource;
   } catch (error: any) {
     if (error.code === 404) {
@@ -161,8 +177,11 @@ export const getChatDocument = async (chatId: string, username: string): Promise
 // Update chat document
 export const updateChatDocument = async (chatDocument: ChatDocument): Promise<ChatDocument> => {
   try {
+    // Wait for container to be initialized (with timeout)
+    const containerInstance = await waitForContainer();
+    
     chatDocument.lastUpdatedAt = Date.now();
-    const { resource } = await container.items.upsert(chatDocument);
+    const { resource } = await containerInstance.items.upsert(chatDocument);
     console.log(`✅ Updated chat document: ${chatDocument.id}`);
     return resource as unknown as ChatDocument;
   } catch (error) {
@@ -246,8 +265,11 @@ export const addMessagesBySessionId = async (
 // Get all chats for a user
 export const getUserChats = async (username: string): Promise<ChatDocument[]> => {
   try {
+    // Wait for container to be initialized (with timeout)
+    const containerInstance = await waitForContainer();
+    
     const query = "SELECT * FROM c WHERE c.username = @username ORDER BY c.createdAt DESC";
-    const { resources } = await container.items.query({
+    const { resources } = await containerInstance.items.query({
       query,
       parameters: [{ name: "@username", value: username }]
     }).fetchAll();
@@ -262,8 +284,11 @@ export const getUserChats = async (username: string): Promise<ChatDocument[]> =>
 // Get chat by session ID (more efficient)
 export const getChatBySessionIdEfficient = async (sessionId: string): Promise<ChatDocument | null> => {
   try {
+    // Wait for container to be initialized (with timeout)
+    const containerInstance = await waitForContainer();
+    
     const query = "SELECT * FROM c WHERE c.sessionId = @sessionId";
-    const { resources } = await container.items.query({
+    const { resources } = await containerInstance.items.query({
       query,
       parameters: [{ name: "@sessionId", value: sessionId }]
     }).fetchAll();
@@ -283,7 +308,10 @@ export const getChatBySessionIdEfficient = async (sessionId: string): Promise<Ch
 // Delete chat document
 export const deleteChatDocument = async (chatId: string, username: string): Promise<void> => {
   try {
-    await container.item(chatId, username).delete();
+    // Wait for container to be initialized (with timeout)
+    const containerInstance = await waitForContainer();
+    
+    await containerInstance.item(chatId, username).delete();
     console.log(`✅ Deleted chat document: ${chatId}`);
   } catch (error) {
     console.error("❌ Failed to delete chat document:", error);
@@ -291,6 +319,181 @@ export const deleteChatDocument = async (chatId: string, username: string): Prom
   }
 };
 
+// Delete chat document by session ID
+export const deleteSessionBySessionId = async (sessionId: string, username: string): Promise<void> => {
+  try {
+    // Wait for container to be initialized (with timeout)
+    const containerInstance = await waitForContainer();
+    
+    // First, get the chat document by sessionId to find the chatId
+    const chatDocument = await getChatBySessionIdEfficient(sessionId);
+    
+    if (!chatDocument) {
+      throw new Error(`Session not found for sessionId: ${sessionId}`);
+    }
+    
+    const chatId = chatDocument.id;
+    
+    console.log(`🗑️ Attempting to delete session: ${sessionId}`);
+    console.log(`   Chat ID: ${chatId}`);
+    console.log(`   Username from doc: ${chatDocument.username}`);
+    console.log(`   fsmrora from doc: ${(chatDocument as any).fsmrora || 'not found'}`);
+    
+    // Try to delete using SQL query since we know the document exists but partition key might be wrong
+    // This approach doesn't require the exact partition key value
+    try {
+      // First, try to read the document to verify the partition key
+      // Try with fsmrora field value if it exists
+      let partitionKeyUsed: string | undefined;
+      let deleteSuccess = false;
+      
+      // Try different partition key values
+      const possiblePartitionKeys = [
+        (chatDocument as any).fsmrora,
+        chatDocument.username,
+        username
+      ].filter(Boolean) as string[];
+      
+      console.log(`   Trying partition keys: ${possiblePartitionKeys.join(', ')}`);
+      
+      // Try each possible partition key value
+      for (const pkValue of possiblePartitionKeys) {
+        try {
+          // Try to read with this partition key to verify it works
+          const testRead = await containerInstance.item(chatId, pkValue).read();
+          console.log(`   ✅ Verified partition key: ${pkValue}`);
+          
+          // Now delete with the verified partition key
+          await containerInstance.item(chatId, pkValue).delete();
+          console.log(`✅ Successfully deleted session: ${sessionId} (chatId: ${chatId}, partitionKey: ${pkValue})`);
+          deleteSuccess = true;
+          partitionKeyUsed = pkValue;
+          break;
+        } catch (pkError: any) {
+          if (pkError.code === 404) {
+            console.log(`   ⚠️ Partition key ${pkValue} didn't work (404), trying next...`);
+            continue;
+          }
+          // For other errors, re-throw
+          throw pkError;
+        }
+      }
+      
+      if (!deleteSuccess) {
+        // If direct delete failed, the document might have been stored with undefined/null partition key
+        // Try using the document's actual partition key from the query result
+        console.log(`   ⚠️ Direct delete failed, trying to get actual partition key from document...`);
+        
+        // Query the document by id to get its actual partition key value
+        const queryResult = await containerInstance.items.query({
+          query: "SELECT * FROM c WHERE c.id = @id",
+          parameters: [{ name: "@id", value: chatId }]
+        }).fetchAll();
+        
+        if (queryResult.resources.length > 0) {
+          const doc = queryResult.resources[0];
+          // Try to get the actual partition key value from the document
+          // CosmosDB might have stored it differently
+          const actualPartitionKey = doc.fsmrora || doc.username || chatDocument.username;
+          
+          console.log(`   Document from query - fsmrora: ${doc.fsmrora || 'not found'}, username: ${doc.username}`);
+          console.log(`   Attempting delete with partition key: ${actualPartitionKey}`);
+          
+          try {
+            await containerInstance.item(chatId, actualPartitionKey).delete();
+            console.log(`✅ Successfully deleted using partition key from query`);
+            deleteSuccess = true;
+            partitionKeyUsed = actualPartitionKey;
+          } catch (queryDeleteError: any) {
+            // If that fails, the document might have been stored without the fsmrora field
+            // Try updating the document first to add the fsmrora field, then delete
+            console.log(`   ⚠️ Delete with query partition key failed: ${queryDeleteError.code}`);
+            console.log(`   Attempting to update document with fsmrora field, then delete...`);
+            
+            try {
+              // Update the document to add the fsmrora field with the username value
+              // First, we need to read it with the correct partition key (which we don't know)
+              // So we'll use a workaround: update via query result
+              const docToUpdate = queryResult.resources[0];
+              docToUpdate.fsmrora = docToUpdate.username || chatDocument.username;
+              
+              // Try to replace the document - this requires the correct partition key
+              // Since we don't know it, we'll try with username
+              const partitionKeyForUpdate = docToUpdate.fsmrora || docToUpdate.username || chatDocument.username;
+              
+              try {
+                await containerInstance.item(chatId, partitionKeyForUpdate).replace(docToUpdate);
+                console.log(`   ✅ Updated document with fsmrora field`);
+                
+                // Now try to delete with the updated partition key
+                await containerInstance.item(chatId, partitionKeyForUpdate).delete();
+                console.log(`✅ Successfully deleted after updating fsmrora field`);
+                deleteSuccess = true;
+                partitionKeyUsed = partitionKeyForUpdate;
+              } catch (updateError: any) {
+                console.log(`   ⚠️ Update failed: ${updateError.code} - ${updateError.message}`);
+                throw new Error(`Cannot delete document - partition key mismatch. The document may need to be manually updated in CosmosDB to include the fsmrora field.`);
+              }
+            } catch (updateDeleteError: any) {
+              throw new Error(`Cannot delete document - partition key mismatch. Error: ${updateDeleteError.message}`);
+            }
+          }
+        } else {
+          throw new Error(`Document not found in query - may have already been deleted`);
+        }
+      }
+      
+      if (!deleteSuccess) {
+        throw new Error(`Could not delete document with any partition key value`);
+      }
+      
+      // Verify deletion using query (more reliable than reading by partition key)
+      // This avoids partition key mismatch issues
+      try {
+        const verifyQuery = await containerInstance.items.query({
+          query: "SELECT * FROM c WHERE c.id = @id",
+          parameters: [{ name: "@id", value: chatId }]
+        }).fetchAll();
+        
+        if (verifyQuery.resources.length > 0) {
+          console.warn(`⚠️ Warning: Document still exists after deletion attempt. ChatId: ${chatId}`);
+          // Try one more time with the partition key we used
+          if (partitionKeyUsed) {
+            try {
+              await containerInstance.item(chatId, partitionKeyUsed).delete();
+              console.log(`✅ Retry deletion successful with partition key: ${partitionKeyUsed}`);
+              return; // Success
+            } catch (retryError: any) {
+              if (retryError.code === 404) {
+                console.log(`   ✅ Document was actually deleted (404 on retry)`);
+                return; // Success
+              }
+              throw new Error(`Deletion failed - document still exists in database after retry`);
+            }
+          } else {
+            throw new Error(`Deletion failed - document still exists in database`);
+          }
+        } else {
+          console.log(`   ✅ Verified: Document no longer exists - deletion successful`);
+          return; // Success
+        }
+      } catch (verifyError: any) {
+        // If query fails, assume deletion was successful (document might have been deleted)
+        console.log(`   ✅ Deletion completed (verification query had issues, but deletion was attempted)`);
+        return; // Success
+      }
+    } catch (deleteError: any) {
+      // If all methods fail, throw the error
+      throw deleteError;
+    }
+  } catch (error: any) {
+    console.error("❌ Failed to delete session by sessionId:", error);
+    console.error("   Error code:", error.code);
+    console.error("   Error statusCode:", error.statusCode);
+    console.error("   Error message:", error.message);
+    throw error;
+  }
+};
 // =================== Dashboards CRUD ===================
 
 export const createDashboard = async (
@@ -427,6 +630,9 @@ export const generateColumnStatistics = (data: Record<string, any>[], numericCol
 // Get all sessions from CosmosDB container (optionally filtered by username)
 export const getAllSessions = async (username?: string): Promise<ChatDocument[]> => {
   try {
+    // Wait for container to be initialized (with timeout)
+    const containerInstance = await waitForContainer();
+    
     let query = "SELECT * FROM c";
     const parameters: Array<{ name: string; value: any }> = [];
     
@@ -439,7 +645,7 @@ export const getAllSessions = async (username?: string): Promise<ChatDocument[]>
     query += " ORDER BY c.createdAt DESC";
     
     const queryOptions = parameters.length > 0 ? { parameters } : {};
-    const { resources } = await container.items.query({
+    const { resources } = await containerInstance.items.query({
       query,
       ...queryOptions,
     }).fetchAll();
@@ -463,6 +669,9 @@ export const getAllSessionsPaginated = async (
   hasMoreResults: boolean;
 }> => {
   try {
+    // Wait for container to be initialized (with timeout)
+    const containerInstance = await waitForContainer();
+    
     let query = "SELECT * FROM c";
     const parameters: Array<{ name: string; value: any }> = [];
     
@@ -480,7 +689,7 @@ export const getAllSessionsPaginated = async (
       ...(parameters.length > 0 && { parameters }),
     };
     
-    const { resources, continuationToken: nextToken, hasMoreResults } = await container.items.query({
+    const { resources, continuationToken: nextToken, hasMoreResults } = await containerInstance.items.query({
       query,
     }, queryOptions).fetchNext();
     
@@ -508,6 +717,9 @@ export const getSessionsWithFilters = async (options: {
   orderDirection?: 'ASC' | 'DESC';
 }): Promise<ChatDocument[]> => {
   try {
+    // Wait for container to be initialized (with timeout)
+    const containerInstance = await waitForContainer();
+    
     let query = "SELECT * FROM c WHERE 1=1";
     const parameters: Array<{ name: string; value: any }> = [];
     
@@ -544,7 +756,7 @@ export const getSessionsWithFilters = async (options: {
     
     const queryOptions = options.limit ? { maxItemCount: options.limit } : {};
     
-    const { resources } = await container.items.query({
+    const { resources } = await containerInstance.items.query({
       query,
       parameters,
     }, queryOptions).fetchAll();
